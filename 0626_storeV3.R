@@ -22,6 +22,7 @@ run_simulation <- function(recipe_stages, L=0.005, C_o=0.2, Nx=101) {
   D0 <- 2.3e-5      # m^2/s
   Qd <- 148000      # J/mol
   R_const <- 8.314  # J/(mol·K)
+
   # --- 1a. 物理參數 ---
   calculate_D <- function(temp_C) { D0 * exp(-Qd / (R_const * (temp_C + 273.15))) }
   
@@ -55,8 +56,8 @@ run_simulation <- function(recipe_stages, L=0.005, C_o=0.2, Nx=101) {
     # 在計算完成後，檢查是否到達階段末尾
     if (current_stage_index < length(recipe_stages)) { # 只檢查到倒數第二個階段
       if ((n * dt) >= stage_end_times_s[current_stage_index]) {
-        stage_info <- recipe_stages[[current_stage_index]]
-        temp_df <- data.frame(
+        stage_info <- recipe_stages[[current_stage_index]] #取出當前這個即將結束的階段的詳細說明名字
+        temp_df <- data.frame( 
           depth_mm = x * 1000, concentration = C,
           time_hr = round(stage_end_times_s[current_stage_index] / 3600, 1),
           stage = sprintf("End of %s", stage_info$name)
@@ -99,7 +100,7 @@ setup_database <- function(base_path) {
   recipes_path <- file.path(base_path, "recipes.csv")
   if (!file.exists(recipes_path)) {
     # 創建一個包含所有可能欄位的空檔案頭
-    empty_df <- data.frame(Run_ID=character(), Recipe_Name=character(), Iteration=integer(),
+    empty_df <- data.frame(Run_ID=character(),
                            Profile_File_Path=character(), Plot_Data_File_Path=character())
     write.csv(empty_df, recipes_path, row.names = FALSE)
   }
@@ -112,14 +113,14 @@ setup_database <- function(base_path) {
   }
 }
 
-save_run_to_db <- function(base_path, run_id, recipe_name, iteration, recipe, simulation_results) {
+save_run_to_db <- function(base_path, run_id, recipe, simulation_results) {
   
   # 從 list 中提取數據
   final_profile <- simulation_results$final_profile
   plot_data <- simulation_results$plot_data
   
   # 1. 準備並儲存 Recipe 主表
-  recipe_list <- list(Run_ID = run_id, Recipe_Name = recipe_name, Iteration = iteration)
+  recipe_list <- list(Run_ID = run_id)
   for (i in 1:length(recipe)) {
     stage <- recipe[[i]]
     recipe_list[[paste0("Stage", i, "_Temp_C")]] <- stage$temp_C
@@ -158,57 +159,78 @@ log_iteration <- function(base_path, iter, af_value, selected_run_id) {
               sep = ",", row.names = FALSE, col.names = FALSE)
 }
 
+# ===================================================================
+#           PART 3: 定義參數空間與生成配方
+# ===================================================================
+
+# --- 3a. 定義製程參數的範圍 ---
+param_space <- list(
+  temp_C    = c(850, 900, 950),
+  surface_C = c(0.4, 0.8, 1.2, 1.6),
+  duration  = c(0.5, 1.0, 1.5, 2.0, 2.5)
+)
+
+# --- 3b. 生成所有可能的單段製程組合 ---
+single_stage_recipes <- expand.grid(param_space) %>%
+  mutate(name = paste0("T", temp_C, "_C", surface_C, "_D", duration))
+
+cat(sprintf("Total possible single-stage recipes: %d\n", nrow(single_stage_recipes)))
+
+# --- 3c. 生成所有可能的兩段製程組合 ---
+all_two_stage_combinations <- expand.grid(
+  Stage1_idx = 1:nrow(single_stage_recipes),
+  Stage2_idx = 1:nrow(single_stage_recipes)
+)
+
+cat(sprintf("Total possible two-stage recipes: %d\n", nrow(all_two_stage_combinations)))
+
+# --- 3d. 不再抽樣，直接使用所有組合 ---
+recipes_to_run <- all_two_stage_combinations
+
 
 # ===================================================================
-#           PART 3: 序貫式優化框架 (主執行腳本)
+#           PART 4: 執行模擬並建立資料庫
 # ===================================================================
 
-# --- 3a. 初始化 ---
-database_path <- "C:/Users/USER/Desktop/PYCProfessor/CarburizationDB_Final" 
+# --- 4a. 初始化資料庫 ---
+database_path <- "C:/Users/USER/Desktop/PYCProfessor/CarburizationDB_Full"
 setup_database(database_path)
 
-# --- 3b. 迭代 0: 初始設計 (Initial Design) ---
-cat("--- Running Initial Design ---\n")
-initial_recipes <- list(
-  "init_01" = list(list(duration=2.0, temp_C=950, surface_C=1.2, name="Boost"),
-                   list(duration=3.0, temp_C=920, surface_C=0.9, name="Diffuse")),
-  "init_02" = list(list(duration=2.5, temp_C=940, surface_C=1.15, name="Boost"),
-                   list(duration=3.5, temp_C=910, surface_C=0.85, name="Diffuse"))
-)
-for (i in 1:length(initial_recipes)) {
-  run_id <- names(initial_recipes)[i]
-  recipe <- initial_recipes[[i]]  #從 initial_recipes 這個大清單中，拿出第 1 個元素
+# --- 4b. 遍歷抽樣的配方並運行模擬 ---
+total_runs <- nrow(recipes_to_run) # 這裡 total_runs 會是 3600
+cat(sprintf("\n--- Starting to generate all %d recipes. This will take a long time. ---\n", total_runs))
+
+for (i in 1:total_runs) {
   
-  simulation_results <- run_simulation(recipe)
-  save_run_to_db(database_path, run_id, run_id, iteration = 0, recipe, simulation_results)
+  # 創建唯一、數字化的 Run_ID
+  run_id <- sprintf("%04d", i)
+  
+  # 獲取當前要運行的組合的索引
+  comb <- recipes_to_run[i, ] 
+  stage1_params <- single_stage_recipes[comb$Stage1_idx, ]
+  stage2_params <- single_stage_recipes[comb$Stage2_idx, ]
+  
+  # 組合成 run_simulation 需要的格式，並手動賦予階段名稱
+  stage1_list <- as.list(stage1_params)
+  stage2_list <- as.list(stage2_params)
+  
+  # 為每個階段手動添加 'name'
+  stage1_list$name <- "Boost"
+  stage2_list$name <- "Diffuse"
+  
+  current_recipe <- list(stage1_list, stage2_list)
+  
+  # 打印進度
+  cat(sprintf("\nRunning %s (%d/%d)...\n", run_id, i, total_runs))
+  
+  # 運行模擬 
+  simulation_results <- run_simulation(recipe_stages = current_recipe)
+  
+  # 儲存到資料庫 (使用不含 iteration 的 save_run_to_db 版本)
+  save_run_to_db(base_path = database_path,
+                 run_id = run_id,
+                 recipe = current_recipe,
+                 simulation_results = simulation_results)
 }
 
-# --- 3c. 序貫式優化迴圈 (模擬) ---
-N_iterations <- 3 
-for (iter in 1:N_iterations) {
-  cat(sprintf("\n--- Simulating Sequential Optimization Iteration: %d ---\n", iter))
-  
-  # 虛設步驟 1 & 2: 讀取數據庫，建模，並找到下一個點
-  cat("Step 1 & 2: Modeling and finding next point (dummy)...\n")
-  next_recipe <- list(
-    list(duration = round(runif(1, 1.5, 3.0),1), temp_C = round(runif(1, 900, 960)), surface_C = round(runif(1, 0.8, 1.3),2), name="Boost"),
-    list(duration = round(runif(1, 2.0, 4.0),1), temp_C = round(runif(1, 880, 930)), surface_C = round(runif(1, 0.7, 1.0),2), name="Diffuse")
-  )
-  max_af_value <- runif(1, 0.01, 0.1)
-  run_id <- sprintf("iter_%02d", iter)
-  
-  # 步驟 3: 運行模擬
-  cat(sprintf("Step 3: Running simulation for '%s'...\n", run_id))
-  simulation_results <- run_simulation(next_recipe)
-  
-  # 步驟 4: 儲存結果
-  cat("Step 4: Saving run data to database...\n")
-  save_run_to_db(database_path, run_id, run_id, iteration = iter, next_recipe, simulation_results)
-  
-  # 步驟 5: 記錄迭代日誌
-  cat("Step 5: Logging iteration decision...\n")
-  log_iteration(database_path, iter, max_af_value, run_id)
-}
-
-cat("\n--- Iterative Data Logging Simulation Complete. ---\n")
-cat(sprintf("Please check the folder: %s\n", database_path))
+cat("\n--- Full 3600-run database generation complete! ---\n")
